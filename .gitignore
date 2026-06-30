@@ -1,0 +1,8 @@
+# Explicitly downloaded USPTO-480K/USPTO-MIT datasets and archives.
+# Existing tracked USPTO-50K/example files remain tracked by Git.
+external/
+src/data/USPTO480K/
+data/USPTO480K/
+*.zip
+__pycache__/
+.pytest_cache/

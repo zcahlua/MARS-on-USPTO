@@ -44,6 +44,52 @@ MARS remains the original motif-based autoregressive retrosynthesis model. The U
 
 MARS derives graph edits by comparing atom-mapped reactants with atom-mapped products. Input reactions **must** be atom-mapped reaction SMILES. The converter validates that product heavy atoms have nonzero atom-map numbers and that every mapped product atom appears in the reactants. Unmapped USPTO-MIT tokenized files fail fast instead of producing invalid transformations.
 
+
+### Downloading USPTO-MIT / USPTO-480K
+
+Use the WLN/NIPS17 `USPTO/data.zip` source as the default for MARS because it is documented upstream as fully atom-mapped. MARS cannot derive reliable graph edits from unmapped USPTO-MIT files. MolecularTransformer tokenized files and DeepChem CSV files must pass the same atom-map validation before use; otherwise the converter will fail in `--strict_map` mode.
+
+| Source | Link | Format | Atom mapped? | Recommended for MARS? | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `wengong-jin/nips17-rexgen USPTO/data.zip` | <https://github.com/wengong-jin/nips17-rexgen/raw/master/USPTO/data.zip> | zipped train/dev/test text files, each line starts with reaction SMILES followed by reaction-center metadata | yes, according to upstream README | yes | preferred source for MARS USPTO-480K experiments |
+| `MolecularTransformer tokenized data` | <https://ibm.ent.box.com/v/MolecularTransformerData> | tokenized `src-*.txt` / `tgt-*.txt`, mixed and separated reactant/reagent variants | not guaranteed | no, unless atom maps are confirmed or the user explicitly remaps | useful for MolecularTransformer-style baselines, not direct MARS graph-edit extraction; see also <https://github.com/pschwllr/MolecularTransformer> |
+| `DeepChem USPTO_MIT.csv` | <https://deepchemdata.s3.us-west-1.amazonaws.com/datasets/USPTO_MIT.csv> | CSV, reaction SMILES typically shaped as `reactants>reagents>product` | validate before use | only if strict atom-map validation passes | convenient direct CSV source, but not the default MARS source |
+
+The upstream WLN/NIPS17 source page is <https://github.com/wengong-jin/nips17-rexgen/tree/master/USPTO>. Its README describes `USPTO/data.zip` as the train/dev/test split of the USPTO dataset, totaling about 480K fully atom-mapped reactions. Each nonempty line starts with atom-mapped reaction SMILES and may include reaction-center metadata after whitespace. The upstream `dev` split is mapped to the MARS `valid` split by the converter.
+
+Manual download example:
+
+```bash
+mkdir -p external/USPTO480K
+curl -L \
+  -o external/USPTO480K/uspto480k_wln.zip \
+  https://github.com/wengong-jin/nips17-rexgen/raw/master/USPTO/data.zip
+unzip -o external/USPTO480K/uspto480k_wln.zip -d external/USPTO480K/wln
+```
+
+Or use the explicit helper script; it downloads and extracts only when the user runs it and does not start conversion automatically:
+
+```bash
+bash scripts/download_uspto480k.sh
+python src/convert_uspto_mit.py \
+  --input_dir external/USPTO480K/wln \
+  --output_dir src/data/USPTO480K \
+  --format wln \
+  --strict_map \
+  --overwrite
+```
+
+Next conversion command after manual download:
+
+```bash
+python src/convert_uspto_mit.py \
+  --input_dir external/USPTO480K/wln \
+  --output_dir src/data/USPTO480K \
+  --format wln \
+  --strict_map \
+  --overwrite
+```
+
 ### Supported input formats
 
 The converter writes the raw layout expected by MARS:
@@ -56,6 +102,7 @@ Each `raw.csv` contains `rxn_smiles`, `class`, `source_id`, `source_split`, and 
 
 Supported inputs are:
 
+* WLN/NIPS17 USPTO-480K split text files (`train.txt`, `dev.txt`/`valid.txt`/`val.txt`, `test.txt`) via `--format wln` or `--format auto`. The first whitespace-separated field is parsed as reaction SMILES; remaining fields are preserved as `reaction_center` and `source_meta`.
 * MARS-style CSV split files with `rxn_smiles` or `reaction_smiles`. Reactions in `reactants>reagents>products` form are converted to `reactants>>products`.
 * MolecularTransformer-style text files: `src-train.txt`/`tgt-train.txt`, `src-val.txt`/`tgt-val.txt`, and `src-test.txt`/`tgt-test.txt`. Token spaces are removed before validation.
 
