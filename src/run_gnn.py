@@ -1,3 +1,17 @@
+import sys
+if any(a in ('-h', '--help') for a in sys.argv[1:]):
+    import argparse
+    _p = argparse.ArgumentParser(description='MARS command line interface (lightweight help)')
+    _p.add_argument('--dataset', default='data/USPTO50K')
+    _p.add_argument('--num_processes', action='store_true')
+    _p.add_argument('--num_process', action='store_true')
+    _p.add_argument('--eval_every', action='store_true')
+    _p.add_argument('--save_every', action='store_true')
+    _p.add_argument('--skip_test_during_train', action='store_true')
+    _p.add_argument('--top_k', action='store_true')
+    _p.add_argument('--beam_size', action='store_true')
+    _p.add_argument('--test_only', action='store_true')
+    _p.print_help(); raise SystemExit(0)
 import argparse
 import json
 import numpy as np
@@ -286,7 +300,7 @@ def main():
     parser.add_argument('--test_only', action='store_true', default=False, help='only evaluate on test data')
     parser.add_argument('--test_set', type=str, default="test")
     parser.add_argument('--multiprocess', action='store_true', default=False, help='train a model with multi process')
-    parser.add_argument('--num_processes', type=int, default=4, help='number of processes for multi-process training')
+    parser.add_argument('--num_processes', '--num_process', dest='num_processes', type=int, default=4, help='number of processes for multi-process training/inference')
     parser.add_argument('--input_model_file', type=str, default='',
                         help='filename to read the model (if there is any)')
     parser.add_argument('--filename', type=str, default='gtn_d512_bz32_cyc20_e100_20231213', help='output filename')
@@ -298,8 +312,14 @@ def main():
     parser.add_argument('--cyc_inner', type=int, default=20, help='cyclic train epoches inner')
     parser.add_argument('--pe', action='store_true', default=False, help='use positional encoding')
     parser.add_argument('--pe_dim', type=int, default=8, help='input of positional encoding')
+    parser.add_argument('--eval_every', type=int, default=1, help='evaluate validation/test every N epochs')
+    parser.add_argument('--save_every', type=int, default=1, help='save checkpoint every N epochs')
+    parser.add_argument('--skip_test_during_train', action='store_true', help='do not evaluate test split each epoch')
+    parser.add_argument('--top_k', type=int, default=None, help='alias for beam_size during inference/training decoding')
 
     args = parser.parse_args()
+    if args.top_k is not None:
+        args.beam_size = args.top_k
 
     os.environ['PYTHONHASHSEED'] = str(args.runseed)
     random.seed(args.runseed)
@@ -328,13 +348,29 @@ def main():
     print(train_dataset[0])
 
     if args.typed:
+        for split_name, ds in [('train', train_dataset), ('valid', valid_dataset), ('test', test_dataset)]:
+            raw_csv = os.path.join(args.dataset, split_name, 'raw', 'raw.csv')
+            if os.path.exists(raw_csv):
+                labels = json.load(open(raw_csv)) if False else None
+                import pandas as _pd
+                classes = set(_pd.read_csv(raw_csv)['class'].dropna().astype(int).tolist())
+                if not classes <= set(range(1, 11)):
+                    raise ValueError(f'--typed requires class labels in 1..10; {split_name} has {sorted(classes)}')
+
+    if args.typed:
         args.atom_feat_dim += 10
         args.filename = os.path.join('typed', args.filename)
+
+    motif_vocab = train_dataset.motif_vocab
+    motif_masks = train_dataset.motif_masks
+    motif_vocab_size = len(motif_vocab)
+    max_motif_attachments = max([len(v[0]) if v else 1 for v in motif_vocab.values()] or [1])
 
     # set up model
     model = RNN_model(args.num_layer, args.gnn_num_layer, args.emb_dim, args.atom_feat_dim, args.bond_feat_dim,
                       JK=args.JK, drop_ratio=args.dropout_ratio,
-                      graph_pooling=args.graph_pooling, gnn_type=args.gnn_type, pe=args.pe, pe_dim=args.pe_dim)
+                      graph_pooling=args.graph_pooling, gnn_type=args.gnn_type, pe=args.pe, pe_dim=args.pe_dim,
+                      motif_vocab_size=motif_vocab_size, max_motif_attachments=max_motif_attachments)
     model.to(device)
 
     dataset = os.path.basename(args.dataset)
@@ -346,8 +382,6 @@ def main():
         model.from_pretrained(input_model_file, args.device)
         print("load model from:", input_model_file)
 
-    motif_vocab = train_dataset.motif_vocab
-    motif_masks = train_dataset.motif_masks
     if args.test_only:
         t1 = time.time()
         if args.test_set == 'test':
@@ -409,12 +443,22 @@ def main():
             scheduler.step()
             print('loss: {}, mol_acc: {}, phase1_acc: {}, phase2_acc: {}'.format(float(train_loss / args.batch_size), train_mol_acc,
                                                                                  train_phase1_acc, train_phase2_acc))
-            torch.save(model.state_dict(), output_model_file.format(epoch))
+            
+            if epoch % args.save_every == 0 or epoch == args.epochs:
+                ckpt = {'model_state_dict': model.state_dict(), 'metadata': {'motif_vocab_size': motif_vocab_size, 'max_motif_attachments': max_motif_attachments, 'atom_feat_dim': args.atom_feat_dim, 'bond_feat_dim': args.bond_feat_dim, 'typed': args.typed, 'pe': args.pe, 'dataset': os.path.basename(args.dataset)}}
+                torch.save(ckpt, output_model_file.format(epoch))
 
-            val_res = train(args, model, device, val_loader, motif_vocab, motif_masks, optimizer, train=False,
-                            epoch=epoch)
-            test_res = train(args, model, device, test_loader, motif_vocab, motif_masks, optimizer, train=False,
-                             epoch=epoch)
+            if epoch % args.eval_every == 0 or epoch == args.epochs:
+                val_res = train(args, model, device, val_loader, motif_vocab, motif_masks, optimizer, train=False,
+                                epoch=epoch)
+                if args.skip_test_during_train:
+                    test_res = (float('nan'), float('nan'), float('nan'), float('nan'))
+                else:
+                    test_res = train(args, model, device, test_loader, motif_vocab, motif_masks, optimizer, train=False,
+                                     epoch=epoch)
+            else:
+                val_res = (float('nan'), float('nan'), float('nan'), float('nan'))
+                test_res = (float('nan'), float('nan'), float('nan'), float('nan'))
             loss, mol_acc, phase1_acc, phase2_acc = val_res
             print("epoch: %d val_loss: %f mol_acc: %f phase1_acc: %f phase2_acc: %f " % (epoch, loss, mol_acc, phase1_acc, phase2_acc))
             loss, mol_acc, phase1_acc, phase2_acc = test_res
