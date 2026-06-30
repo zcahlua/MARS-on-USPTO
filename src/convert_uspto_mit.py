@@ -66,12 +66,17 @@ def validate_mapped_rxn(rxn):
     product_maps = [a.GetAtomMapNum() for a in p.GetAtoms() if a.GetAtomicNum() > 1]
     if not product_maps:
         return False, "empty_product"
-    if any(m == 0 for m in product_maps):
-        return False, "unmapped_product"
+    valid_product_maps = [m for m in product_maps if m != 0]
+    if not valid_product_maps:
+        return False, "empty_product"
     reactant_maps = {a.GetAtomMapNum() for a in r.GetAtoms() if a.GetAtomMapNum() != 0}
-    missing = sorted(set(product_maps) - reactant_maps)
+    missing = sorted(set(valid_product_maps) - reactant_maps)
     if missing:
         return False, "product_map_missing_in_reactants:" + ",".join(map(str, missing[:10]))
+    unmapped_product = sum(1 for m in product_maps if m == 0)
+    unmapped_reactant = sum(1 for a in r.GetAtoms() if a.GetAtomicNum() > 1 and a.GetAtomMapNum() == 0)
+    if unmapped_product > unmapped_reactant:
+        return False, "too_many_unmapped_product_atoms"
     return True, ""
 
 
