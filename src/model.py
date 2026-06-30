@@ -16,7 +16,7 @@ import pickle
 
 class RNN_model(torch.nn.Module):
     def __init__(self, num_layer, gnn_num_layer, emb_dim, atom_feat_dim, bond_feat_dim, JK="last", drop_ratio=0,
-                 graph_pooling="mean", gnn_type="gin", pe=False, pe_dim=8):
+                 graph_pooling="mean", gnn_type="gin", pe=False, pe_dim=8, motif_vocab_size=211, max_motif_attachments=4):
         super(RNN_model, self).__init__()
         embedding_dim = emb_dim
         hidden_size = emb_dim
@@ -34,8 +34,10 @@ class RNN_model(torch.nn.Module):
         self.embedding_atom = nn.Linear(in_features=gnn_feat_dim, out_features=embedding_dim)
         self.embedding_bond = nn.Linear(in_features=gnn_feat_dim, out_features=embedding_dim)
         self.embedding_bond_type = nn.Embedding(num_embeddings=4, embedding_dim=embedding_dim)
-        self.embedding_motif = nn.Embedding(num_embeddings=300, embedding_dim=embedding_dim)
-        self.embedding_motif_attach_idx = nn.Embedding(num_embeddings=4, embedding_dim=embedding_dim)
+        self.motif_vocab_size = int(motif_vocab_size)
+        self.max_motif_attachments = int(max_motif_attachments)
+        self.embedding_motif = nn.Embedding(num_embeddings=self.motif_vocab_size + 1, embedding_dim=embedding_dim)
+        self.embedding_motif_attach_idx = nn.Embedding(num_embeddings=self.max_motif_attachments, embedding_dim=embedding_dim)
         self.embedding_mol = nn.Sequential(
             nn.Linear(in_features=gnn_feat_dim, out_features=hidden_size * n_layers),
             Mish(),
@@ -61,12 +63,12 @@ class RNN_model(torch.nn.Module):
             nn.Linear(in_features=gnn_feat_dim + hidden_size, out_features=hidden_size),
             Mish(),
             nn.Dropout(0.4),
-            nn.Linear(in_features=hidden_size, out_features=211)
+            nn.Linear(in_features=hidden_size, out_features=self.motif_vocab_size)
         )
         self.MLP_motif_attach_idx = nn.Sequential(
             nn.Linear(in_features=gnn_feat_dim + hidden_size + embedding_dim, out_features=hidden_size),
             Mish(),
-            nn.Linear(in_features=hidden_size, out_features=4)
+            nn.Linear(in_features=hidden_size, out_features=self.max_motif_attachments)
         )
         self.MLP_edge = nn.parameter.Parameter(torch.randn(gnn_feat_dim + hidden_size, embedding_dim))
 
@@ -500,10 +502,15 @@ class RNN_model(torch.nn.Module):
     def from_pretrained(self, model_file, device=0):
         if torch.cuda.is_available():
             params = torch.load(model_file, map_location='cuda:{}'.format(device))
+            if isinstance(params, dict) and 'model_state_dict' in params:
+                params = params['model_state_dict']
             print(params.keys())
             self.load_state_dict(params)
         else:
-            self.load_state_dict(torch.load(model_file, map_location='cpu'))
+            params = torch.load(model_file, map_location='cpu')
+            if isinstance(params, dict) and 'model_state_dict' in params:
+                params = params['model_state_dict']
+            self.load_state_dict(params)
 
 
 class GNN_graphpred(torch.nn.Module):

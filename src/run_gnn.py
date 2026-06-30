@@ -1,3 +1,19 @@
+import sys
+if any(a in ('-h', '--help') for a in sys.argv[1:]):
+    import argparse
+    _p = argparse.ArgumentParser(description='MARS command line interface (lightweight help)')
+    _p.add_argument('--dataset', default='data/USPTO50K')
+    _p.add_argument('--num_processes', type=int)
+    _p.add_argument('--num_process', type=int)
+    _p.add_argument('--eval_every', type=int)
+    _p.add_argument('--save_every', type=int)
+    _p.add_argument('--skip_test_during_train', action='store_true')
+    _p.add_argument('--top_k', type=int)
+    _p.add_argument('--beam_size', type=int)
+    _p.add_argument('--test_only', action='store_true')
+    _p.add_argument('--eval_subset', type=int)
+    _p.add_argument('--count_skipped_as_misses', action='store_true')
+    _p.print_help(); raise SystemExit(0)
 import argparse
 import json
 import numpy as np
@@ -25,6 +41,61 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from cyclic_lr import *
 
 
+def get_git_commit():
+    try:
+        import subprocess
+        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return None
+
+
+def checkpoint_metadata(args, motif_vocab_size, max_motif_attachments):
+    return {
+        'dataset': args.dataset,
+        'dataset_name': os.path.basename(os.path.normpath(args.dataset)),
+        'motif_vocab_size': int(motif_vocab_size),
+        'max_motif_attachments': int(max_motif_attachments),
+        'atom_feat_dim': int(args.atom_feat_dim),
+        'bond_feat_dim': int(args.bond_feat_dim),
+        'typed': bool(args.typed),
+        'pe': bool(args.pe),
+        'pe_dim': int(args.pe_dim),
+        'git_commit': get_git_commit(),
+    }
+
+
+def validate_checkpoint_metadata(metadata, expected):
+    if not metadata:
+        return
+    for key in ('motif_vocab_size', 'max_motif_attachments', 'atom_feat_dim', 'bond_feat_dim', 'typed', 'pe', 'pe_dim'):
+        if key in metadata and metadata[key] != expected[key]:
+            raise ValueError(
+                'Checkpoint metadata mismatch for {}: checkpoint={} current={}. '
+                'Use the checkpoint with the matching dataset/motif vocabulary.'.format(key, metadata[key], expected[key])
+            )
+
+
+def load_model_checkpoint(model, model_file, device, expected_metadata):
+    map_location = 'cuda:{}'.format(device) if torch.cuda.is_available() else 'cpu'
+    checkpoint = torch.load(model_file, map_location=map_location)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        validate_checkpoint_metadata(checkpoint.get('metadata', {}), expected_metadata)
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+
+
+def evaluation_denominator(dataset, processed_count, args):
+    if not args.count_skipped_as_misses:
+        return processed_count
+    manifest_path = os.path.join(dataset.root, 'preprocess_manifest.json')
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+        return int(manifest.get('evaluation_denominator', manifest.get('raw_rows', processed_count)))
+    return processed_count
+
+
 def train(args, model, device, loader, motif_vocab, motif_masks, optimizer=None, train=True, epoch=1):
     if train:
         model.train()
@@ -37,6 +108,8 @@ def train(args, model, device, loader, motif_vocab, motif_masks, optimizer=None,
     pred_phase2_list = []
 
     for step, batch in enumerate(tqdm(loader, desc="Iteration")):
+        if not train and args.eval_subset is not None and step >= args.eval_subset:
+            break
         batch = batch[0].to(device), batch[1].to(device)
         loss, pred_res = model(batch, args.typed, motif_vocab=motif_vocab, motif_masks=motif_masks, epoch=epoch)
         loss_list.append(loss.item())
@@ -115,7 +188,8 @@ def eval(args, model, device, test_dataset, motif_vocab, motif_masks):
         for rank in range(args.beam_size):
             cnt[rank] += sum
             sum = cnt[rank]
-            message = 'Top-{} acc: {}'.format(rank + 1, cnt[rank] / len(pred_ranks))
+            denom = evaluation_denominator(test_dataset, len(pred_ranks), args)
+            message = 'Top-{} acc: {}'.format(rank + 1, cnt[rank] / denom)
             print(message)
             f.write(message + '\n')
 
@@ -126,6 +200,8 @@ def eval_multi_process(args, model, device, test_dataset, motif_vocab, motif_mas
     model.eval()
 
     data_chunks = []
+    if args.eval_subset is not None:
+        test_dataset.process_data_files = test_dataset.process_data_files[:args.eval_subset]
     # test_dataset.process_data_files = test_dataset.process_data_files[:1000]
     chunk_size = len(test_dataset.process_data_files) // args.num_processes + 1
     for i in range(0, len(test_dataset.process_data_files), chunk_size):
@@ -168,7 +244,8 @@ def eval_multi_process(args, model, device, test_dataset, motif_vocab, motif_mas
         for rank in range(args.beam_size):
             cnt[rank] += sum
             sum = cnt[rank]
-            message = 'Top-{} acc: {}'.format(rank + 1, cnt[rank] / len(pred_ranks))
+            denom = evaluation_denominator(test_dataset, len(pred_ranks), args)
+            message = 'Top-{} acc: {}'.format(rank + 1, cnt[rank] / denom)
             print(message)
             f.write(message + '\n')
 
@@ -286,7 +363,7 @@ def main():
     parser.add_argument('--test_only', action='store_true', default=False, help='only evaluate on test data')
     parser.add_argument('--test_set', type=str, default="test")
     parser.add_argument('--multiprocess', action='store_true', default=False, help='train a model with multi process')
-    parser.add_argument('--num_processes', type=int, default=4, help='number of processes for multi-process training')
+    parser.add_argument('--num_processes', '--num_process', dest='num_processes', type=int, default=4, help='number of processes for multi-process training/inference')
     parser.add_argument('--input_model_file', type=str, default='',
                         help='filename to read the model (if there is any)')
     parser.add_argument('--filename', type=str, default='gtn_d512_bz32_cyc20_e100_20231213', help='output filename')
@@ -298,8 +375,16 @@ def main():
     parser.add_argument('--cyc_inner', type=int, default=20, help='cyclic train epoches inner')
     parser.add_argument('--pe', action='store_true', default=False, help='use positional encoding')
     parser.add_argument('--pe_dim', type=int, default=8, help='input of positional encoding')
+    parser.add_argument('--eval_every', type=int, default=1, help='evaluate validation/test every N epochs')
+    parser.add_argument('--save_every', type=int, default=1, help='save checkpoint every N epochs')
+    parser.add_argument('--skip_test_during_train', action='store_true', help='do not evaluate test split each epoch')
+    parser.add_argument('--top_k', type=int, default=None, help='alias for beam_size during inference/training decoding')
+    parser.add_argument('--eval_subset', type=int, default=None, help='limit periodic eval/test-only decoding to N examples')
+    parser.add_argument('--count_skipped_as_misses', action='store_true', help='include skipped/OOV/invalid manifest rows in evaluation denominator')
 
     args = parser.parse_args()
+    if args.top_k is not None:
+        args.beam_size = args.top_k
 
     os.environ['PYTHONHASHSEED'] = str(args.runseed)
     random.seed(args.runseed)
@@ -319,22 +404,41 @@ def main():
     test_dataset = MoleculeDataset(args.dataset, split='test')
     if args.process_data:
         train_dataset.process_data()
+        train_dataset = MoleculeDataset(args.dataset, split='train')
         valid_dataset.process_data()
         test_dataset.process_data()
         train_dataset.encode_transformation(train_dataset.motif_vocab)
-        valid_dataset.encode_transformation(train_dataset.motif_vocab)
-        test_dataset.encode_transformation(train_dataset.motif_vocab)
+        valid_dataset.encode_transformation(train_dataset.motif_vocab, count_skipped_as_misses=args.count_skipped_as_misses)
+        test_dataset.encode_transformation(train_dataset.motif_vocab, count_skipped_as_misses=args.count_skipped_as_misses)
+        valid_dataset = MoleculeDataset(args.dataset, split='valid')
+        test_dataset = MoleculeDataset(args.dataset, split='test')
 
     print(train_dataset[0])
+
+    if args.typed:
+        for split_name, ds in [('train', train_dataset), ('valid', valid_dataset), ('test', test_dataset)]:
+            raw_csv = os.path.join(args.dataset, split_name, 'raw', 'raw.csv')
+            if os.path.exists(raw_csv):
+                labels = json.load(open(raw_csv)) if False else None
+                import pandas as _pd
+                classes = set(_pd.read_csv(raw_csv)['class'].dropna().astype(int).tolist())
+                if not classes <= set(range(1, 11)):
+                    raise ValueError(f'--typed requires class labels in 1..10; {split_name} has {sorted(classes)}')
 
     if args.typed:
         args.atom_feat_dim += 10
         args.filename = os.path.join('typed', args.filename)
 
+    motif_vocab = train_dataset.motif_vocab
+    motif_masks = train_dataset.motif_masks
+    motif_vocab_size = len(motif_vocab)
+    max_motif_attachments = train_dataset.max_motif_attachments
+
     # set up model
     model = RNN_model(args.num_layer, args.gnn_num_layer, args.emb_dim, args.atom_feat_dim, args.bond_feat_dim,
                       JK=args.JK, drop_ratio=args.dropout_ratio,
-                      graph_pooling=args.graph_pooling, gnn_type=args.gnn_type, pe=args.pe, pe_dim=args.pe_dim)
+                      graph_pooling=args.graph_pooling, gnn_type=args.gnn_type, pe=args.pe, pe_dim=args.pe_dim,
+                      motif_vocab_size=motif_vocab_size, max_motif_attachments=max_motif_attachments)
     model.to(device)
 
     dataset = os.path.basename(args.dataset)
@@ -343,11 +447,10 @@ def main():
     print('log filename:', args.filename)
     if not args.input_model_file == "":
         input_model_file = os.path.join(args.filename, args.input_model_file)
-        model.from_pretrained(input_model_file, args.device)
+        expected_metadata = checkpoint_metadata(args, motif_vocab_size, max_motif_attachments)
+        load_model_checkpoint(model, input_model_file, args.device, expected_metadata)
         print("load model from:", input_model_file)
 
-    motif_vocab = train_dataset.motif_vocab
-    motif_masks = train_dataset.motif_masks
     if args.test_only:
         t1 = time.time()
         if args.test_set == 'test':
@@ -362,7 +465,7 @@ def main():
         t2 = time.time()
         print("prediction acc:", acc)
         print(t2 - t1)
-        exit(1)
+        exit(0)
 
     if args.multiprocess:
         mp.set_start_method('spawn', force=True)
@@ -409,12 +512,22 @@ def main():
             scheduler.step()
             print('loss: {}, mol_acc: {}, phase1_acc: {}, phase2_acc: {}'.format(float(train_loss / args.batch_size), train_mol_acc,
                                                                                  train_phase1_acc, train_phase2_acc))
-            torch.save(model.state_dict(), output_model_file.format(epoch))
+            
+            if epoch % args.save_every == 0 or epoch == args.epochs:
+                ckpt = {'model_state_dict': model.state_dict(), 'metadata': checkpoint_metadata(args, motif_vocab_size, max_motif_attachments)}
+                torch.save(ckpt, output_model_file.format(epoch))
 
-            val_res = train(args, model, device, val_loader, motif_vocab, motif_masks, optimizer, train=False,
-                            epoch=epoch)
-            test_res = train(args, model, device, test_loader, motif_vocab, motif_masks, optimizer, train=False,
-                             epoch=epoch)
+            if epoch % args.eval_every == 0 or epoch == args.epochs:
+                val_res = train(args, model, device, val_loader, motif_vocab, motif_masks, optimizer, train=False,
+                                epoch=epoch)
+                if args.skip_test_during_train:
+                    test_res = (float('nan'), float('nan'), float('nan'), float('nan'))
+                else:
+                    test_res = train(args, model, device, test_loader, motif_vocab, motif_masks, optimizer, train=False,
+                                     epoch=epoch)
+            else:
+                val_res = (float('nan'), float('nan'), float('nan'), float('nan'))
+                test_res = (float('nan'), float('nan'), float('nan'), float('nan'))
             loss, mol_acc, phase1_acc, phase2_acc = val_res
             print("epoch: %d val_loss: %f mol_acc: %f phase1_acc: %f phase2_acc: %f " % (epoch, loss, mol_acc, phase1_acc, phase2_acc))
             loss, mol_acc, phase1_acc, phase2_acc = test_res

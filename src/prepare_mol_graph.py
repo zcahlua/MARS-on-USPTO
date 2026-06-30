@@ -1,3 +1,17 @@
+import sys
+if any(a in ('-h', '--help') for a in sys.argv[1:]):
+    import argparse
+    _p = argparse.ArgumentParser(description='MARS command line interface (lightweight help)')
+    _p.add_argument('--dataset', default='data/USPTO50K')
+    _p.add_argument('--splits', default='train,valid,test')
+    _p.add_argument('--overwrite', action='store_true')
+    _p.add_argument('--resume', action='store_true')
+    _p.add_argument('--limit_per_split', type=int)
+    _p.add_argument('--strict_map', action='store_true')
+    _p.add_argument('--strict_oov', action='store_true')
+    _p.add_argument('--count_skipped_as_misses', action='store_true')
+    _p.add_argument('--num_workers', type=int, default=1)
+    _p.print_help(); raise SystemExit(0)
 import collections
 import copy
 import json
@@ -27,7 +41,7 @@ from utils import *
 
 
 def smarts2smiles(smarts, sanitize=True, canonical=True):
-    t = re.sub(':\d*', '', smarts)
+    t = re.sub(r':\d*', '', smarts)
     mol = Chem.MolFromSmiles(t, sanitize=sanitize)
     return Chem.MolToSmiles(mol, canonical=canonical)
 
@@ -248,6 +262,10 @@ class MoleculeDataset(Dataset):
             self.process_data_files = [os.path.join(self.processed_dir, f) for f in files]
 
         self.indexed_motifs_json = os.path.join(self.root, 'indexed_motifs.json')
+        self.motif_vocab = collections.OrderedDict()
+        self.motif_masks = {}
+        self.motif_vocab_size = 0
+        self.max_motif_attachments = 1
         if os.path.isfile(self.indexed_motifs_json) and split == 'train':
             with open(self.indexed_motifs_json) as f:
                 self.indexed_motifs = json.load(f)
@@ -260,6 +278,7 @@ class MoleculeDataset(Dataset):
                     motif_vocab[mt] = attachments
                     for att in attachments:
                         max_attachments = max(max_attachments, len(att))
+            self.max_motif_attachments = max_attachments
             print('max_attachments in encode_transformation:', max_attachments)
 
             keys = sorted(motif_vocab.keys())
@@ -274,12 +293,13 @@ class MoleculeDataset(Dataset):
                 self.motif_vocab[key].append(symbols)
 
             # prepare the motif masks for decoding
-            self.motif_masks = {symbol: torch.zeros((1, 211), dtype=torch.float32) for symbol in attachment_symbols}
+            self.motif_masks = {symbol: torch.zeros((1, len(keys)), dtype=torch.float32) for symbol in attachment_symbols}
             for symbol, motif in self.indexed_motifs.items():
                 for mt, attachments in motif.items():
                     assert mt in keys
                     idx = keys.index(mt)
                     self.motif_masks[symbol][0][idx] = 1
+            self.motif_vocab_size = len(self.motif_vocab)
 
     def len(self):
         return len(self.processed_file_names)
@@ -341,10 +361,31 @@ class MoleculeDataset(Dataset):
         lg_smi_cano_dict = {}
         lg_smi_dict = {}
         cnt_lc = 0
-        for k, rxn in tqdm(enumerate(rxns)):
+        limit = getattr(self, "limit_per_split", None)
+        manifest = {"raw_rows": int(len(rxns)), "processed_rows": 0, "skipped_rows": 0, "skip_reasons": {}, "oov_motif_count": 0, "parse_failures": 0, "atom_map_validation_failures": 0, "heavy_atom_product_failures": 0, "evaluation_denominator": int(len(rxns))}
+        for k, rxn in tqdm(enumerate(rxns[:limit] if limit else rxns)):
             # if k < 298: continue
-            reactant, product = rxn.strip().split('>>')
+            try:
+                reactant, product = rxn.strip().split('>>')
+            except ValueError:
+                skipped += 1
+                manifest["skipped_rows"] += 1; manifest["parse_failures"] += 1
+                manifest["skip_reasons"]["bad_reaction_format"] = manifest["skip_reasons"].get("bad_reaction_format", 0) + 1
+                continue
             r_mol = Chem.MolFromSmiles(reactant)
+            p_mol = Chem.MolFromSmiles(product)
+            if r_mol is None or p_mol is None:
+                skipped += 1
+                manifest["skipped_rows"] += 1; manifest["parse_failures"] += 1
+                manifest["skip_reasons"]["parse_failure"] = manifest["skip_reasons"].get("parse_failure", 0) + 1
+                continue
+            product_maps = [atom.GetAtomMapNum() for atom in p_mol.GetAtoms() if atom.GetAtomicNum() > 1]
+            reactant_maps = {atom.GetAtomMapNum() for atom in r_mol.GetAtoms() if atom.GetAtomMapNum() != 0}
+            if not product_maps or any(map_num == 0 for map_num in product_maps) or not set(product_maps) <= reactant_maps:
+                skipped += 1
+                manifest["skipped_rows"] += 1; manifest["atom_map_validation_failures"] += 1
+                manifest["skip_reasons"]["atom_map_validation_failure"] = manifest["skip_reasons"].get("atom_map_validation_failure", 0) + 1
+                continue
             # make sure all atoms have a mapping number
             max_mapnum = 0
             for atom in r_mol.GetAtoms():
@@ -353,10 +394,12 @@ class MoleculeDataset(Dataset):
                 if atom.GetAtomMapNum() == 0:
                     max_mapnum += 1
                     atom.SetAtomMapNum(max_mapnum)
-            p_mol = Chem.MolFromSmiles(product)
             n_atom = p_mol.GetNumAtoms()
 
             if p_mol.GetNumHeavyAtoms() <= 1:
+                skipped += 1
+                manifest["skipped_rows"] += 1; manifest["heavy_atom_product_failures"] += 1
+                manifest["skip_reasons"]["heavy_atom_product_failure"] = manifest["skip_reasons"].get("heavy_atom_product_failure", 0) + 1
                 continue
 
             # make the reactant kekulized in the same way as the product
@@ -366,6 +409,7 @@ class MoleculeDataset(Dataset):
                 p_smi = Chem.MolToSmiles(p_mol_kekulized, kekuleSmiles=True)
             except:
                 skipped += 1
+                manifest["skipped_rows"] += 1; manifest["skip_reasons"]["kekule_failure"] = manifest["skip_reasons"].get("kekule_failure", 0) + 1
                 continue
             if not chemutils.cycle_transform(mol=r_mol_kekulized):
                 print('can not make the reactant kekulized in the same way as the product')
@@ -374,6 +418,7 @@ class MoleculeDataset(Dataset):
             if not chemutils.cycle_transform(mol=r_mol_kekulized) or not chemutils.cycle_transform(mol=p_mol_kekulized):
                 print('can not align kekule pair, skip')
                 skipped += 1
+                manifest["skipped_rows"] += 1; manifest["skip_reasons"]["kekule_alignment_failure"] = manifest["skip_reasons"].get("kekule_alignment_failure", 0) + 1
                 continue
 
             reactant = Chem.MolToSmiles(r_mol_kekulized, kekuleSmiles=True)
@@ -512,6 +557,7 @@ class MoleculeDataset(Dataset):
             if 2 in symbols:
                 print('loop found, and skip')
                 skipped += 1
+                manifest["skipped_rows"] += 1; manifest["skip_reasons"]["junction_loop"] = manifest["skip_reasons"].get("junction_loop", 0) + 1
                 cnt4 += 1
                 continue
 
@@ -542,6 +588,10 @@ class MoleculeDataset(Dataset):
             with open(processed_data_file, 'wb') as f:
                 pickle.dump(precessed_rxn, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+        manifest['processed_rows'] = len(self.process_data_files)
+        with open(os.path.join(self.root, 'preprocess_manifest.json'), 'w') as f:
+            json.dump(manifest, f, indent=2)
+
         with open(self.indexed_motifs_json.replace('indexed_motifs.json', 'lg_smis.json'), 'w', encoding='utf-8') as f:
             json.dump(lg_smi_cano_dict, f, indent=4, sort_keys=True)
         with open(self.indexed_motifs_json.replace('indexed_motifs.json', 'lg_smis_origin.json'), 'w',
@@ -562,9 +612,11 @@ class MoleculeDataset(Dataset):
         with open(self.indexed_motifs_json, 'w', encoding='utf-8') as f:
             json.dump(sorted_indexed_motifs, f, indent=4, sort_keys=True)
 
-    def encode_transformation(self, motif_vocab):
+    def encode_transformation(self, motif_vocab, strict_oov=False, count_skipped_as_misses=False):
 
         motifs = list(motif_vocab.keys())
+        kept_files = []
+        skipped_oov = 0
         for idx, pfn in enumerate(tqdm(self.processed_file_names)):
             gnn_data, gnn_data_synthon = self.get(idx)
 
@@ -584,6 +636,17 @@ class MoleculeDataset(Dataset):
 
             jgraph = gnn_data.junction_graph
             jgraph.build_transformation_path(motifs)
+            if any(tp[1] >= len(motifs) for tp in jgraph.transformation_path):
+                msg = "skip OOV motif in {}".format(pfn)
+                print(msg)
+                if strict_oov:
+                    raise ValueError(msg)
+                skipped_oov += 1
+                try:
+                    os.remove(pfn)
+                except OSError:
+                    pass
+                continue
 
             # build rnn input and target sequence
             rnn_input, rnn_target = [], []
@@ -630,18 +693,63 @@ class MoleculeDataset(Dataset):
                 gnn_data.synthon_attachment_idx2symbols = dict2string(gnn_data.synthon_attachment_idx2symbols)
                 pickle.dump({'gnn_data': gnn_data, 'junction_graph': jgraph, 'gnn_data_synthon': gnn_data_synthon}, f,
                             protocol=pickle.HIGHEST_PROTOCOL)
+            kept_files.append(pfn)
+        self.process_data_files = kept_files
+        if skipped_oov:
+            manifest_path = os.path.join(self.root, 'preprocess_manifest.json')
+            manifest = {}
+            if os.path.exists(manifest_path):
+                with open(manifest_path) as f:
+                    manifest = json.load(f)
+            manifest['oov_motif_count'] = skipped_oov
+            if count_skipped_as_misses:
+                manifest['evaluation_denominator'] = manifest.get('raw_rows', len(self.process_data_files) + skipped_oov)
+            with open(manifest_path, 'w') as f:
+                json.dump(manifest, f, indent=2)
 
+
+def main():
+    import argparse, shutil
+    parser = argparse.ArgumentParser(description='Preprocess MARS reaction data into graph pickles.')
+    parser.add_argument('--dataset', default='data/USPTO50K')
+    parser.add_argument('--splits', default='train,valid,test')
+    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--limit_per_split', type=int, default=None)
+    parser.add_argument('--strict_map', action='store_true')
+    parser.add_argument('--strict_oov', action='store_true')
+    parser.add_argument('--count_skipped_as_misses', action='store_true')
+    parser.add_argument('--num_workers', type=int, default=1, help='Reserved; preprocessing remains single-process because RDKit/PyG pickling has shared mutable state in this pipeline.')
+    args = parser.parse_args()
+    if args.num_workers != 1:
+        print('WARNING: prepare_mol_graph.py accepts --num_workers but runs single-process because RDKit/PyG pickle writes are not safe here.')
+    splits = [s.strip() for s in args.splits.split(',') if s.strip()]
+    if 'train' in splits:
+        splits.remove('train'); splits.insert(0, 'train')
+    train_dataset = None
+    for split in splits:
+        ds = MoleculeDataset(args.dataset, split)
+        ds.limit_per_split = args.limit_per_split
+        if args.overwrite and os.path.isdir(ds.processed_dir):
+            shutil.rmtree(ds.processed_dir)
+        if os.path.isdir(ds.processed_dir) and ds.processed_file_names and not args.overwrite and not args.resume:
+            print(f'skip {split}: processed files exist (use --overwrite or --resume to rebuild/continue)')
+        else:
+            ds.process_data()
+        if split == 'train':
+            train_dataset = MoleculeDataset(args.dataset, 'train')
+            with open(os.path.join(args.dataset, 'motif_vocab.pkl'), 'wb') as f:
+                pickle.dump(train_dataset.motif_vocab, f)
+            motif_meta = {
+                'motif_vocab_size': len(train_dataset.motif_vocab),
+                'max_motif_attachments': train_dataset.max_motif_attachments,
+                'source_split': 'train',
+            }
+            with open(os.path.join(args.dataset, 'motif_meta.json'), 'w') as f:
+                json.dump(motif_meta, f, indent=2)
+        if train_dataset is None:
+            train_dataset = MoleculeDataset(args.dataset, 'train')
+        ds.encode_transformation(train_dataset.motif_vocab, strict_oov=args.strict_oov, count_skipped_as_misses=args.count_skipped_as_misses)
 
 if __name__ == "__main__":
-    for split in ['test', 'valid', 'train']:
-        dataset_train = MoleculeDataset('data/USPTO50K', split)
-        dataset_train.process_data()
-
-    dataset_train = MoleculeDataset('data/USPTO50K', 'train')
-    motif_vocabs = dataset_train.motif_vocab
-    with open('data/USPTO50K/motif_vocab.pkl', 'wb') as f:
-        pickle.dump(motif_vocabs, f)
-
-    for split in ['valid', 'train', 'test']:
-        dataset_test = MoleculeDataset('data/USPTO50K', split)
-        dataset_test.encode_transformation(dataset_train.motif_vocab)
+    main()
