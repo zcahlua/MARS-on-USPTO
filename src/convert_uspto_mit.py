@@ -27,10 +27,13 @@ def validate_mapped_rxn(rxn):
     r=Chem.MolFromSmiles(reactants); p=Chem.MolFromSmiles(product)
     if r is None or p is None: return False,'parse_failure'
     product_maps=[a.GetAtomMapNum() for a in p.GetAtoms() if a.GetAtomicNum()>1]
-    if not product_maps or any(m==0 for m in product_maps): return False,'unmapped_product'
+    if not product_maps or all(m==0 for m in product_maps): return False,'unmapped_product'
     reactant_maps={a.GetAtomMapNum() for a in r.GetAtoms() if a.GetAtomMapNum()!=0}
-    missing=sorted(set(product_maps)-reactant_maps)
+    missing=sorted(set(m for m in product_maps if m!=0)-reactant_maps)
     if missing: return False,'product_map_missing_in_reactants:'+','.join(map(str,missing[:10]))
+    product_unmapped=sum(1 for a in p.GetAtoms() if a.GetAtomicNum()>1 and a.GetAtomMapNum()==0)
+    reactant_unmapped=sum(1 for a in r.GetAtoms() if a.GetAtomicNum()>1 and a.GetAtomMapNum()==0)
+    if product_unmapped>reactant_unmapped: return False,'unmapped_product_atoms_exceed_reactant'
     return True,''
 
 def read_csv_split(path, split, typed):
